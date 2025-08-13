@@ -1,0 +1,57 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+.env
+.env.*
+
+# Distribution / packaging
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Testing / coverage
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+.tox/
+.nox/
+htmlcov/
+
+# Type checker caches
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Streamlit cache
+.streamlit/**
+!/.streamlit/
+
+# Local data outputs (keep original data source tracked)
+# Ignore the generated cleaned CSV
+/data/disciplinas_limpo.csv
+
+# Logs
+*.log
+
+# Misc
+*.swp
+*.swo
