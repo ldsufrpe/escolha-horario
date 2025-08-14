@@ -1,3 +1,4 @@
+# python
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -14,8 +15,6 @@ DIAS_SEMANA_MAP = {
     "QUI": "Quinta-feira",
     "SEX": "Sexta-feira",
     "SAB": "Sábado"
-    # If you need Sunday as well, add:
-    # "DOM": "Domingo"
 }
 
 TURNOS = {
@@ -25,6 +24,53 @@ TURNOS = {
 }
 
 MAX_COMBINACOES = 100000  # limite de segurança para geração
+
+# --- ESTADO GLOBAL DO FLUXO E FIXAÇÃO ---
+
+if "current_step" not in st.session_state:
+    # 1: Seleção; 2: Revisão+Fixar; 3: Agrupar+Gerar
+    st.session_state["current_step"] = 1
+
+# Mantém compatibilidade com seleção atual
+if "selecionados_ids" not in st.session_state:
+    st.session_state["selecionados_ids"] = []
+
+# Conjunto de ROW_IDs fixos (subconjunto de selecionados)
+if "fixos_ids" not in st.session_state:
+    st.session_state["fixos_ids"] = set()
+
+# Sinaliza que a seleção foi confirmada na Etapa 2
+if "confirmado" not in st.session_state:
+    st.session_state["confirmado"] = False
+
+# Grupos de fixas (Etapa 3): mapa ROW_ID -> rótulo do grupo (ex.: "Grupo A"/"Grupo B"/"Grupo C"/"Sem grupo")
+if "mapa_grupos_fixas" not in st.session_state:
+    st.session_state["mapa_grupos_fixas"] = {}  # {ROW_ID: label}
+
+# Configuração de como tratar fixas "Sem grupo"
+if "singles_sao_obrigatorias" not in st.session_state:
+    st.session_state["singles_sao_obrigatorias"] = False
+
+def _ensure_fixed_subset_of_selected():
+    """Garante que fixos ⊆ selecionados."""
+    st.session_state["fixos_ids"] = set(map(str, st.session_state.get("fixos_ids", set()))) & set(map(str, st.session_state.get("selecionados_ids", [])))
+
+def _go_to_step(step: int):
+    st.session_state["current_step"] = int(step)
+
+def _style_bold_fixed(df_show: pd.DataFrame, fixed_ids: set):
+    """Retorna um Styler com linhas fixas em negrito."""
+    if "ROW_ID" not in df_show.columns:
+        return df_show
+    df_show = df_show.copy()
+    df_show["ROW_ID"] = df_show["ROW_ID"].astype(str)
+    df_show = df_show.set_index("ROW_ID", drop=False)
+    def _bold_row(idx):
+        return ['font-weight: bold'] * len(df_show.columns) if idx in fixed_ids else [''] * len(df_show.columns)
+    try:
+        return df_show.style.apply(lambda s: _bold_row(s.name), axis=1)
+    except Exception:
+        return df_show
 
 # --- FUNÇÕES AUXILIARES ---
 
@@ -186,9 +232,9 @@ def check_conflito(disciplinas_selecionadas):
     Retorna:
         (tem_conflito: bool, conflitos: list[tuple])
         Onde cada tupla é:
-        (disciplina1, inicio1, disciplina2, inicio2, dia, fim1, fim2)
-        Todos os horários formatados como "HH:MM" para exibição.
+        (disciplina1, inicio1, disciplina2, inicio2, dia, fim1, fim2, turma1, turma2)
     """
+    from itertools import combinations as _comb
     conflitos = []
     try:
         if getattr(disciplinas_selecionadas, "empty", False) or len(disciplinas_selecionadas) < 2:
@@ -204,12 +250,13 @@ def check_conflito(disciplinas_selecionadas):
                 continue
             todos_horarios.append({
                 "disciplina": disc.get('DISCIPLINA', 'N/A'),
+                "turma": disc.get('TURMA', 'N/A'),
                 "dia": horario['dia'],
                 "inicio": horario['inicio'],
                 "fim": horario['fim']
             })
 
-    for h1, h2 in combinations(todos_horarios, 2):
+    for h1, h2 in _comb(todos_horarios, 2):
         if h1['dia'] != h2['dia']:
             continue
         if h1['inicio'] < h2['fim'] and h2['inicio'] < h1['fim']:
@@ -220,10 +267,19 @@ def check_conflito(disciplinas_selecionadas):
                 h2['inicio'].strftime("%H:%M"),
                 h1['dia'],
                 h1['fim'].strftime("%H:%M"),
-                h2['fim'].strftime("%H:%M")
+                h2['fim'].strftime("%H:%M"),
+                h1.get('turma', 'N/A'),
+                h2.get('turma', 'N/A'),
             ))
 
     return (len(conflitos) > 0), conflitos
+
+def conflitos_com_turma_legenda(conflitos):
+    """Formata conflitos incluindo TURMA para exibição."""
+    linhas = []
+    for (d1, t1, d2, t2, dia, f1, f2, turma1, turma2) in conflitos:
+        linhas.append(f"- {dia}: {d1} (Turma {turma1}) {t1}-{f1} ⟂ {d2} (Turma {turma2}) {t2}-{f2}")
+    return linhas
 
 
 def dias_totais_da_grade(df_grade: pd.DataFrame) -> int:
@@ -274,7 +330,7 @@ def is_turno_set_permitido(turnos_set: set) -> bool:
 st.set_page_config(page_title="Montador de Grade Horária", layout="wide")
 
 st.title("🛠️ Montador de Grade Horária")
-st.markdown("Etapa 1: selecione livremente as disciplinas que você se propõe a lecionar. Etapa 2: geramos sugestões sem conflito e com pontuação.")
+st.markdown("Fluxo: Etapa 1 (seleção) → Etapa 2 (revisão e fixação) → Etapa 3 (agrupar fixas e gerar).")
 
 # --- BARRA LATERAL COM FILTROS DA ETAPA 1 ---
 with st.sidebar:
@@ -291,7 +347,6 @@ with st.sidebar:
     limpar = st.button("Limpar filtros (Etapa 1)", use_container_width=True)
 
     if limpar:
-        # Removido: 'filtro_nome_disc_busca'
         st.session_state['filtro_disciplinas'] = []
         st.session_state['filtro_codigos'] = []
         st.session_state['filtro_turmas'] = []
@@ -310,15 +365,9 @@ with st.sidebar:
         turnos_disponiveis = sorted(list(TURNOS.keys()))
         dias_disponiveis = sorted(list(DIAS_SEMANA_MAP.values()))
 
-        # Removido: campo de busca e normalização
-        # Agora o multiselect usa diretamente todas as disciplinas disponíveis
         filtro_disciplinas = st.multiselect("Disciplinas", options=op_disciplinas, key='filtro_disciplinas')
-
-        # Novos filtros: Códigos e Turmas
         filtro_codigos = st.multiselect("Códigos", options=op_codigos, key='filtro_codigos')
         filtro_turmas = st.multiselect("Turmas", options=op_turmas, key='filtro_turmas')
-
-        # Demais filtros
         filtro_cursos = st.multiselect("Cursos", options=cursos_disponiveis, key='filtro_cursos')
         filtro_turnos = st.multiselect("Turnos", options=turnos_disponiveis, key='filtro_turnos')
         filtro_dias = st.multiselect("Dias da semana", options=dias_disponiveis, key='filtro_dias')
@@ -347,7 +396,7 @@ else:
         df_base = df_base.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
     df_base["ROW_ID"] = df_base["ROW_ID"].astype(str)
 
-    # Aplica filtros da Etapa 1 (sem alerta de conflito)
+    # Aplica filtros da Etapa 1
     df_filtrado = df_base.copy()
     if filtro_disciplinas and 'DISCIPLINA' in df_filtrado.columns:
         df_filtrado = df_filtrado[df_filtrado['DISCIPLINA'].isin(filtro_disciplinas)]
@@ -368,7 +417,6 @@ else:
     st.header("Etapa 1 • Ofertas Filtradas")
     st.markdown("Selecione livremente qualquer número de disciplinas. Conflitos não são validados nesta etapa.")
 
-    # Estado atual como set; ROW_ID como string
     selected_ids = set(map(str, st.session_state.get("selecionados_ids", [])))
     df_filtrado = df_filtrado.copy()
     df_filtrado["ROW_ID"] = df_filtrado["ROW_ID"].astype(str)
@@ -432,7 +480,7 @@ else:
             use_container_width=True,
             key="editor_disciplinas",
             column_config=column_config,
-            num_rows="fixed"  # trava estrutura de linhas
+            num_rows="fixed"
         )
         submitted = st.form_submit_button("Aplicar seleção")
 
@@ -451,83 +499,249 @@ else:
         st.session_state["selecionados_ids"] = list(new_state)
         st.success("Seleção aplicada.")
 
+    # Seleção corrente (DataFrame)
     disciplinas_selecionadas_ids = set(map(str, st.session_state.get("selecionados_ids", [])))
     selecionadas_full = df_base[df_base["ROW_ID"].astype(str).isin(disciplinas_selecionadas_ids)].copy()
 
+    # Navegação do fluxo: Etapa 1 → Etapa 2
     st.divider()
+    nav_col1, nav_col2 = st.columns([1, 1])
+    with nav_col1:
+        avancar_disabled = selecionadas_full.empty
+        if st.button("Próxima etapa (revisar e fixar)", disabled=avancar_disabled, use_container_width=True):
+            _ensure_fixed_subset_of_selected()
+            st.session_state["confirmado"] = False
+            _go_to_step(2)
+    with nav_col2:
+        if st.button("Reiniciar fluxo", use_container_width=True):
+            st.session_state["selecionados_ids"] = []
+            st.session_state["fixos_ids"] = set()
+            st.session_state["confirmado"] = False
+            st.session_state["mapa_grupos_fixas"] = {}
+            st.session_state["singles_sao_obrigatorias"] = False
+            _go_to_step(1)
+            st.rerun()
 
-    # ETAPA 2: Refinar seleção e Gerar até 4 sugestões (sem relatório de conflitos no início)
-    st.header("Etapa 2 • Refinar Seleção e Gerar Sugestões")
+    # ETAPA 2: Revisão e Fixação (com relatório de conflitos aqui)
+    if st.session_state["current_step"] == 2:
+        st.header("Etapa 2 • Revisar Seleção e Fixar Disciplinas")
+        _ensure_fixed_subset_of_selected()
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        alvo_num_disciplinas = st.number_input(
-            "Número de disciplinas (0 = usar todas as selecionadas)",
-            min_value=0, max_value=12, value=0, step=1
-        )
-    with col2:
-        alvo_qtd_dias = st.radio(
-            "Dias totais na semana",
-            options=["Qualquer", 2, 3, 4],
-            index=0,
-            horizontal=True
-        )
-    with col3:
-        turnos_pref = st.multiselect("Turnos de preferência (usados no score)", options=list(TURNOS.keys()))
-
-    gerar_sugestoes = st.button("Gerar sugestões (até 4)", type="primary")
-
-    sugestoes = []
-    todas_validas = []
-    combinacoes_geradas = 0
-
-    if gerar_sugestoes:
         if selecionadas_full.empty:
-            st.warning("Selecione ao menos uma disciplina na Etapa 1 antes de gerar sugestões.")
+            st.warning("Sua seleção está vazia. Volte à Etapa 1.")
         else:
-            k = alvo_num_disciplinas if alvo_num_disciplinas > 0 else len(selecionadas_full)
+            st.caption("Marque 'Fixar' para obrigar a presença dessa disciplina nos cenários/grupos da Etapa 3.")
+            for _, row in selecionadas_full.iterrows():
+                rid = str(row["ROW_ID"])
+                label = f"Fixar | {row.get('CODIGO','')} — {row.get('DISCIPLINA','')} — Turma {row.get('TURMA','')}"
+                atual = rid in st.session_state["fixos_ids"]
+                novo_valor = st.checkbox(label, value=atual, key=f"fix_{rid}")
+                if novo_valor:
+                    st.session_state["fixos_ids"].add(rid)
+                else:
+                    st.session_state["fixos_ids"].discard(rid)
 
-            if k <= 0:
-                st.warning("Número de disciplinas inválido.")
-            elif k > len(selecionadas_full):
-                st.warning(f"Você selecionou {len(selecionadas_full)} disciplina(s), mas pediu uma grade com {k}.")
+            # Relatório de conflitos movido para a Etapa 2 e incluindo TURMA
+            if not selecionadas_full.empty:
+                tem_conf, conflitos = check_conflito(selecionadas_full)
+                if tem_conf and conflitos:
+                    with st.expander("Relatório de conflitos na sua seleção (inclui Turma)", expanded=False):
+                        for linha in conflitos_com_turma_legenda(conflitos):
+                            st.write(linha)
+                else:
+                    st.caption("Sua Seleção não contém conflitos.")
+
+            # Ações Etapa 2
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("Voltar para Etapa 1", use_container_width=True):
+                    _go_to_step(1)
+            with c2:
+                if st.button("Confirmar e ir para agrupamento (Etapa 3)", use_container_width=True, type="primary"):
+                    _ensure_fixed_subset_of_selected()
+                    st.session_state["confirmado"] = True
+                    # Inicializa grupos padrão: todos "Sem grupo"
+                    mapa = {}
+                    for rid in st.session_state["fixos_ids"]:
+                        mapa[rid] = "Sem grupo"
+                    st.session_state["mapa_grupos_fixas"] = mapa
+                    # Regra: se há exatamente 1 fixa sem grupo, sugere obrigatória
+                    st.session_state["singles_sao_obrigatorias"] = (len([1 for v in mapa.values() if v == "Sem grupo"]) == 1)
+                    _go_to_step(3)
+
+    # ETAPA 3: Agrupar fixas e gerar (sem geração automática fora do botão)
+    if st.session_state["current_step"] >= 3 and st.session_state["confirmado"]:
+        st.header("Etapa 3 • Agrupar disciplinas fixas e gerar combinações")
+
+        # Preferências gerais de score e alvo
+        pref_col1, pref_col2, pref_col3 = st.columns(3)
+        with pref_col1:
+            alvo_num_disciplinas = st.number_input(
+                "Número de disciplinas (0 = tamanhos variados)",
+                min_value=0, max_value=12, value=0, step=1
+            )
+        with pref_col2:
+            alvo_qtd_dias = st.radio(
+                "Dias totais na semana",
+                options=["Qualquer", 2, 3, 4],
+                index=0,
+                horizontal=True
+            )
+        with pref_col3:
+            turnos_pref = st.multiselect("Turnos de preferência (usados no score)", options=list(TURNOS.keys()))
+
+        # UI de agrupamento das fixas
+        st.subheader("Agrupamento das disciplinas fixas")
+        fixed_ids_set = set(map(str, st.session_state.get("fixos_ids", set())))
+        _ensure_fixed_subset_of_selected()
+
+        base_df = selecionadas_full.copy()
+        base_df["ROW_ID"] = base_df["ROW_ID"].astype(str)
+
+        if not fixed_ids_set:
+            st.info("Você não fixou disciplinas na Etapa 2. Você pode gerar combinações livremente.")
+            df_fixas = pd.DataFrame(columns=base_df.columns)
+        else:
+            df_fixas = base_df[base_df["ROW_ID"].isin(fixed_ids_set)].copy()
+
+        grupos_rotulos = ["Sem grupo", "Grupo A", "Grupo B", "Grupo C"]
+        st.caption("Atribua cada fixa a um grupo. Você pode usar dois grupos para rodadas separadas (OR) ou marcar 'juntos' para exigir todos (AND).")
+
+        # Controles por fixa
+        for _, row in df_fixas.iterrows():
+            rid = str(row["ROW_ID"])
+            label = f"{row.get('CODIGO','')} — {row.get('DISCIPLINA','')} — Turma {row.get('TURMA','')}"
+            default_group = st.session_state["mapa_grupos_fixas"].get(rid, "Sem grupo")
+            st.session_state["mapa_grupos_fixas"][rid] = st.selectbox(
+                f"Grupo de: {label}",
+                options=grupos_rotulos,
+                index=grupos_rotulos.index(default_group) if default_group in grupos_rotulos else 0,
+                key=f"grp_{rid}"
+            )
+
+        # Opções de como combinar grupos
+        st.markdown("Configuração de combinação dos grupos:")
+        cfg1, cfg2 = st.columns([1, 1])
+        with cfg1:
+            combinar_grupos_juntos = st.toggle("Incluir grupos A/B/C juntos (AND)", value=False,
+                                               help="Se ligado, as combinações exigem todos os grupos não vazios simultaneamente. Se desligado, geramos rodadas separadas para cada grupo não vazio (OR).")
+        with cfg2:
+            st.session_state["singles_sao_obrigatorias"] = st.toggle(
+                "Fixas 'Sem grupo' são obrigatórias em todas as sugestões",
+                value=st.session_state["singles_sao_obrigatorias"],
+                help="Se houver exatamente 1 fixa sem grupo, manteremos este valor ligado por padrão."
+            )
+
+        # Botão para gerar
+        gerar = st.button("Gerar combinações", type="primary", use_container_width=True)
+
+        if gerar:
+            # Calcula conjuntos obrigatórios conforme configuração
+            grupos = {"Grupo A": set(), "Grupo B": set(), "Grupo C": set()}
+            singles = set()
+            if fixed_ids_set:
+                for rid, rot in st.session_state["mapa_grupos_fixas"].items():
+                    if rot in grupos:
+                        grupos[rot].add(rid)
+                    else:
+                        singles.add(rid)
+
+            # Define cenários (lista de conjuntos obrigatórios)
+            cenarios = []
+            grupos_nao_vazios = [g for g, s in grupos.items() if len(s) > 0]
+
+            if fixed_ids_set:
+                if combinar_grupos_juntos:
+                    obrig = set().union(*[grupos[g] for g in grupos_nao_vazios]) if grupos_nao_vazios else set()
+                    if st.session_state["singles_sao_obrigatorias"]:
+                        obrig |= singles
+                    cenarios = [obrig]
+                else:
+                    if grupos_nao_vazios:
+                        for g in grupos_nao_vazios:
+                            obrig = set(grupos[g])
+                            if st.session_state["singles_sao_obrigatorias"]:
+                                obrig |= singles
+                            cenarios.append(obrig)
+                    else:
+                        obrig = singles if st.session_state["singles_sao_obrigatorias"] else set()
+                        cenarios = [obrig]
             else:
-                from math import comb
-                try:
-                    total_combos = comb(len(selecionadas_full), k)
-                except ValueError:
-                    total_combos = MAX_COMBINACOES + 1
+                cenarios = [set()]
 
-                if total_combos > MAX_COMBINACOES:
-                    st.warning(
-                        f"Muitas combinações possíveis ({total_combos:,}). "
-                        f"Geraremos um subconjunto para evitar lentidão."
-                    )
+            # Funções auxiliares para validação
+            def _combo_ok(df_combo: pd.DataFrame) -> bool:
+                # 1) Conflitos
+                tem_conf, _ = check_conflito(df_combo)
+                if tem_conf:
+                    return False
+                # 2) Dias totais (se exigido)
+                if alvo_qtd_dias in {2, 3, 4} and dias_totais_da_grade(df_combo) != alvo_qtd_dias:
+                    return False
+                # 3) Regra de turnos consecutivos
+                tset = turnos_da_grade(df_combo)
+                if not is_turno_set_permitido(tset):
+                    return False
+                return True
 
-                indices = list(selecionadas_full.index)
-                for combo_indices in combinations(indices, k):
-                    combinacoes_geradas += 1
-                    if combinacoes_geradas > MAX_COMBINACOES:
+            # Mapeia ROW_ID -> índice de base_df
+            id_to_idx = {rid: idx for idx, rid in zip(base_df.index, base_df["ROW_ID"])}
+
+            total_validas_global = 0
+            from itertools import combinations as _comb
+
+            for idx_cen, obrig_rids in enumerate(cenarios, start=1):
+                st.subheader(f"Cenário {idx_cen}")
+                if obrig_rids:
+                    st.caption("Obrigatórias neste cenário: " + ", ".join(
+                        base_df[base_df["ROW_ID"].isin(obrig_rids)].apply(lambda r: f"{r['DISCIPLINA']} (Turma {r['TURMA']})", axis=1).tolist()
+                    ))
+                else:
+                    st.caption("Sem disciplinas obrigatórias neste cenário.")
+
+                obrig_idx = {id_to_idx[r] for r in obrig_rids if r in id_to_idx}
+                indices = list(base_df.index)
+                resto = [i for i in indices if i not in obrig_idx]
+
+                # Se o usuário escolheu um alvo > 0, respeitar exatamente o tamanho
+                if alvo_num_disciplinas > 0 and len(obrig_idx) > alvo_num_disciplinas:
+                    st.warning(f"Alvo de {alvo_num_disciplinas} é menor que as obrigatórias deste cenário ({len(obrig_idx)}). Nenhuma combinação gerada para este cenário.")
+                    continue
+
+                todas_validas = []
+                combinacoes_geradas = 0
+
+                # Tamanhos a considerar
+                if alvo_num_disciplinas == 0:
+                    tamanhos = range(max(1, len(obrig_idx)), len(indices) + 1)
+                else:
+                    tamanhos = [alvo_num_disciplinas]
+
+                for k in tamanhos:
+                    if k < len(obrig_idx):
+                        continue
+                    if len(obrig_idx) == k:
+                        # Combo é exatamente as obrigatórias
+                        combo_idx = list(sorted(obrig_idx))
+                        df_combo = base_df.loc[combo_idx].copy()
+                        if _combo_ok(df_combo):
+                            todas_validas.append(df_combo)
+                        combinacoes_geradas += 1
+                        if combinacoes_geradas >= MAX_COMBINACOES:
+                            break
+                    else:
+                        for extra in _comb(resto, k - len(obrig_idx)):
+                            combo_idx = list(sorted(obrig_idx)) + list(extra)
+                            df_combo = base_df.loc[combo_idx].copy()
+                            if _combo_ok(df_combo):
+                                todas_validas.append(df_combo)
+                            combinacoes_geradas += 1
+                            if combinacoes_geradas >= MAX_COMBINACOES:
+                                break
+                    if combinacoes_geradas >= MAX_COMBINACOES:
                         break
 
-                    df_combo = selecionadas_full.loc[list(combo_indices)].copy()
-
-                    # 1) Conflitos
-                    tem_conf, _ = check_conflito(df_combo)
-                    if tem_conf:
-                        continue
-
-                    # 2) Dias totais (se exigido)
-                    if alvo_qtd_dias in {2, 3, 4} and dias_totais_da_grade(df_combo) != alvo_qtd_dias:
-                        continue
-
-                    # 3) Regra institucional: apenas dois turnos consecutivos
-                    tset = turnos_da_grade(df_combo)
-                    if not is_turno_set_permitido(tset):
-                        continue
-
-                    todas_validas.append(df_combo)
-
+                # Ordena e exibe
                 todas_validas_sorted = sorted(
                     todas_validas,
                     key=lambda dfc: score_combo(
@@ -538,41 +752,52 @@ else:
                     reverse=True
                 )
 
-                sugestoes = todas_validas_sorted[:4]
+                total_validas_global += len(todas_validas_sorted)
 
-                st.success(f"Geradas {len(sugestoes)} sugestão(ões). Combinações válidas encontradas: {len(todas_validas_sorted)}.")
+                if not todas_validas_sorted:
+                    st.info("Nenhuma combinação válida encontrada neste cenário.")
+                else:
+                    st.success(f"Combinações válidas no cenário {idx_cen}: {len(todas_validas_sorted)} (limite: {MAX_COMBINACOES:,}).")
 
-    # Relatório de conflitos da seleção (apenas nesta etapa)
-    if not selecionadas_full.empty:
-        tem_conf, conflitos = check_conflito(selecionadas_full)
-        if tem_conf and conflitos:
-            with st.expander("Relatório de conflitos na seleção (Etapa 1)", expanded=False):
-                for (d1, t1, d2, t2, dia, faixa1, faixa2) in conflitos:
-                    st.write(f"- {dia}: {d1} ({t1}) {faixa1} ⟂ {d2} ({t2}) {faixa2}")
-        else:
-            st.caption("Sua Seleção (Etapa 1) não contém conflitos.")
+                    # Top 4 sugestões do cenário
+                    sugestoes = todas_validas_sorted[:4]
+                    if sugestoes:
+                        for i, sug in enumerate(sugestoes, start=1):
+                            st.subheader(f"Sugestão #{i} (Cenário {idx_cen})")
+                            view_cols = [c for c in ['CODIGO', 'DISCIPLINA', 'CURSO', 'TURMA', 'Dia 1', 'Dia 2', 'ROW_ID'] if c in sug.columns]
+                            st.caption(f"Dias totais: {dias_totais_da_grade(sug)} • Score: {score_combo(sug, turnos_pref, alvo_qtd_dias if alvo_qtd_dias != 'Qualquer' else None)}")
+                            styled = _style_bold_fixed(sug[view_cols], fixed_ids_set)
+                            try:
+                                st.dataframe(styled, use_container_width=True, hide_index=True)
+                            except Exception:
+                                st.dataframe(sug[view_cols], use_container_width=True, hide_index=True)
+                            st.divider()
 
-    # Mostra até 4 sugestões (Etapa 2)
-    if sugestoes:
-        for i, sug in enumerate(sugestoes, start=1):
-            st.subheader(f"Sugestão #{i} (Etapa 2)")
-            view_cols = [c for c in ['CODIGO', 'DISCIPLINA', 'CURSO', 'TURMA', 'Dia 1', 'Dia 2'] if c in sug.columns]
-            st.caption(f"Dias totais: {dias_totais_da_grade(sug)} • Score: {score_combo(sug, turnos_pref, alvo_qtd_dias if alvo_qtd_dias != 'Qualquer' else None)}")
-            st.dataframe(sug[view_cols], use_container_width=True, hide_index=True)
-            st.divider()
+                    # Lista completa do cenário
+                    st.markdown("Todas as opções válidas deste cenário (ordenadas por score)")
+                    for i, opt in enumerate(todas_validas_sorted, start=1):
+                        with st.expander(f"Opção #{i} • Dias: {dias_totais_da_grade(opt)} • Score: {score_combo(opt, turnos_pref, alvo_qtd_dias if alvo_qtd_dias != 'Qualquer' else None)}"):
+                            view_cols = [c for c in ['CODIGO', 'DISCIPLINA', 'CURSO', 'TURMA', 'Dia 1', 'Dia 2', 'ROW_ID'] if c in opt.columns]
+                            styled = _style_bold_fixed(opt[view_cols], fixed_ids_set)
+                            try:
+                                st.dataframe(styled, use_container_width=True, hide_index=True)
+                            except Exception:
+                                st.dataframe(opt[view_cols], use_container_width=True, hide_index=True)
 
-    # ETAPA 3: Listar todas as opções válidas
-    st.header("Etapa 3 • Todas as Opções Válidas (ordenadas por score)")
-    if gerar_sugestoes and todas_validas:
-        todas_validas_sorted = sorted(
-            todas_validas,
-            key=lambda dfc: score_combo(dfc, turnos_pref, alvo_qtd_dias if alvo_qtd_dias != "Qualquer" else None),
-            reverse=True
-        )
+            if fixed_ids_set:
+                st.caption(f"Destaque: linhas em negrito são disciplinas fixadas na Etapa 2.")
 
-        for i, opt in enumerate(todas_validas_sorted, start=1):
-            with st.expander(f"Opção #{i} • Dias: {dias_totais_da_grade(opt)} • Score: {score_combo(opt, turnos_pref, alvo_qtd_dias if alvo_qtd_dias != 'Qualquer' else None)}"):
-                view_cols = [c for c in ['CODIGO', 'DISCIPLINA', 'CURSO', 'TURMA', 'Dia 1', 'Dia 2'] if c in opt.columns]
-                st.dataframe(opt[view_cols], use_container_width=True, hide_index=True)
-    elif gerar_sugestoes and not todas_validas:
-        st.info("Nenhuma combinação válida foi encontrada com os critérios da Etapa 2.")
+            # Rodapé de navegação
+            foot1, foot2 = st.columns([1, 1])
+            with foot1:
+                if st.button("Voltar para Etapa 2"):
+                    _go_to_step(2)
+            with foot2:
+                if st.button("Reiniciar fluxo (limpar seleção/fixos)"):
+                    st.session_state["selecionados_ids"] = []
+                    st.session_state["fixos_ids"] = set()
+                    st.session_state["confirmado"] = False
+                    st.session_state["mapa_grupos_fixas"] = {}
+                    st.session_state["singles_sao_obrigatorias"] = False
+                    _go_to_step(1)
+                    st.rerun()
